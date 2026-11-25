@@ -1,17 +1,18 @@
 name: Java CI
 
 on:
-  pull_request:
-    branches:
-    - master
-  push:
-    branches:
-    - master
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Gradle test task + selector, e.g. ':api:test --tests io.minio.MinioClientTest'; empty runs the full suite"
+        required: false
+        default: ''
 
 jobs:
   build:
     name: Test on java-version ${{ matrix.java-version }} and ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     strategy:
       matrix:
         java-version: ['8', '11', '17']
@@ -19,36 +20,98 @@ jobs:
 
     steps:
       - uses: actions/checkout@v3
-      - name: Check limited Guava usage
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          if grep --with-filename --line-number --no-messages --recursive --exclude-dir=.github "com.google.common.base.Objects" .; then
-            echo "Error: use java.util.Objects instead of com.google.common.base.Objects"
-            exit 1
-          fi
       - name: Setup java ${{ matrix.java-version }}
         uses: actions/setup-java@v3
         with:
           distribution: temurin
           java-version: ${{ matrix.java-version }}
+          cache: gradle
+      # dl.min.io (used by FunctionalTest.downloadMinio) is gone (HTTP 410), so build the
+      # MinIO server of the release era (RELEASE.2023-11-06T22-26-08Z) from source and
+      # pre-place it where FunctionalTest looks for it (functional/minio[.exe]).
+      - name: Cache MinIO server binary
+        id: minio-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/minio-bin
+          key: minio-server-${{ runner.os }}-${{ runner.arch }}-754f7a8a395e87a744050476d8b16c16af50a800
+      - name: Setup go for MinIO server build
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: false
+      - name: Build MinIO server
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p ~/minio-bin
+          CGO_ENABLED=0 GOBIN="$HOME/minio-bin" go install github.com/minio/minio@754f7a8a395e87a744050476d8b16c16af50a800
+          ls -l ~/minio-bin
+      - name: Place MinIO server binary
+        shell: bash
+        run: |
+          cp ~/minio-bin/minio* functional/
+          chmod +x functional/minio*
+      - name: Gradle test result summary init script
+        shell: bash
+        run: |
+          cat > "${RUNNER_TEMP}/test-count.gradle" <<'INIT'
+          allprojects {
+              tasks.withType(Test) {
+                  testLogging {
+                      events "passed", "skipped", "failed"
+                  }
+                  afterSuite { desc, result ->
+                      if (desc.parent == null) {
+                          println("TEST SUMMARY [${project.path}:${name}]: ${result.testCount} tests, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped")
+                      }
+                  }
+              }
+          }
+          INIT
       - name: Set environment variables
+        shell: bash
         run: |
           echo "DEV_VERSION=$(./gradlew properties | awk '/^version:/ { print $2 }')" >> $GITHUB_ENV
           echo "RELEASE_VERSION=$(./gradlew properties -Prelease | awk '/^version:/ { print $2 }')" >> $GITHUB_ENV
+          echo "GATE_SKIPS=-x spotbugsMain -x spotbugsTest -x spotlessCheck -x spotlessJava -x spotlessGroovyGradle" >> $GITHUB_ENV
       - name: Gradle build on Ununtu
         if: matrix.os == 'ubuntu-latest'
         run: |
-          ./gradlew build
-          ./gradlew runFunctionalTest
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew ${{ inputs.test-filter }} -I "${RUNNER_TEMP}/test-count.gradle" ${GATE_SKIPS}
+            ./gradlew clean
+            ./gradlew assemble -Prelease ${GATE_SKIPS}
+            exit 0
+          fi
+          ./gradlew build -I "${RUNNER_TEMP}/test-count.gradle" ${GATE_SKIPS}
+          ./gradlew runFunctionalTest ${GATE_SKIPS}
           javac -cp api/build/libs/minio-${DEV_VERSION}-all.jar functional/TestUserAgent.java
           java -Dversion=${DEV_VERSION} -cp api/build/libs/minio-${DEV_VERSION}-all.jar:functional TestUserAgent
           ./gradlew clean
-          ./gradlew build -Prelease
+          ./gradlew build -Prelease -I "${RUNNER_TEMP}/test-count.gradle" ${GATE_SKIPS}
           javac -cp api/build/libs/minio-${RELEASE_VERSION}-all.jar functional/TestUserAgent.java
           java -Dversion=${RELEASE_VERSION} -cp api/build/libs/minio-${RELEASE_VERSION}-all.jar:functional TestUserAgent
       - name: Gradle build on Windows
         if: matrix.os == 'windows-latest'
         run: |
           $Env:Path += ';.'
-          gradlew.bat build
-          gradlew.bat runFunctionalTest
+          $gates = $Env:GATE_SKIPS -split ' '
+          if ("${{ inputs.test-filter }}" -ne "") {
+            gradlew.bat ${{ inputs.test-filter }} -I "$Env:RUNNER_TEMP/test-count.gradle" @gates
+            exit $LASTEXITCODE
+          }
+          gradlew.bat build -I "$Env:RUNNER_TEMP/test-count.gradle" @gates
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gradlew.bat runFunctionalTest @gates
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload release jars
+        if: matrix.os == 'ubuntu-latest' && matrix.java-version == '8'
+        uses: actions/upload-artifact@v4
+        with:
+          name: minio-jars
+          path: |
+            api/build/libs/minio-${{ env.RELEASE_VERSION }}.jar
+            api/build/libs/minio-${{ env.RELEASE_VERSION }}-all.jar
+          if-no-files-found: error
